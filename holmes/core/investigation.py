@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Any, Dict, Optional
 
 from holmes.config import Config
@@ -18,6 +19,14 @@ from holmes.plugins.runbooks import RunbookCatalog
 from holmes.utils import sentry_helper
 from holmes.utils.global_instructions import generate_runbooks_args
 
+# Metrics integration
+try:
+    from holmes.core.metrics import get_metrics
+    METRICS_AVAILABLE = True
+except ImportError:
+    METRICS_AVAILABLE = False
+    def get_metrics(): return None
+
 
 def investigate_issues(
     investigate_request: InvestigateRequest,
@@ -28,47 +37,70 @@ def investigate_issues(
     runbooks: Optional[RunbookCatalog] = None,
     request_context: Optional[Dict[str, Any]] = None,
 ) -> InvestigationResult:
-    context = dal.get_issue_data(investigate_request.context.get("robusta_issue_id"))
+    # Metrics tracking
+    metrics = get_metrics() if METRICS_AVAILABLE else None
+    start_time = time.time()
+    success = False
+    source = investigate_request.source
+    
+    try:
+        context = dal.get_issue_data(investigate_request.context.get("robusta_issue_id"))
 
-    global_instructions = dal.get_global_instructions_for_account()
+        global_instructions = dal.get_global_instructions_for_account()
 
-    raw_data = investigate_request.model_dump()
-    if context:
-        raw_data["extra_context"] = context
+        raw_data = investigate_request.model_dump()
+        if context:
+            raw_data["extra_context"] = context
 
-    # If config is not preinitilized
-    create_issue_investigator_span = trace_span.start_span(
-        "create_issue_investigator", SpanType.FUNCTION.value
-    )
-    ai = config.create_issue_investigator(dal=dal, model=model)
-    create_issue_investigator_span.end()
+        # If config is not preinitilized
+        create_issue_investigator_span = trace_span.start_span(
+            "create_issue_investigator", SpanType.FUNCTION.value
+        )
+        ai = config.create_issue_investigator(dal=dal, model=model)
+        create_issue_investigator_span.end()
 
-    issue = Issue(
-        id=context["id"] if context else "",
-        name=investigate_request.title,
-        source_type=investigate_request.source,
-        source_instance_id=investigate_request.source_instance_id,
-        raw=raw_data,
-    )
+        issue = Issue(
+            id=context["id"] if context else "",
+            name=investigate_request.title,
+            source_type=investigate_request.source,
+            source_instance_id=investigate_request.source_instance_id,
+            raw=raw_data,
+        )
 
-    investigation = ai.investigate(
-        issue,
-        prompt=investigate_request.prompt_template,
-        global_instructions=global_instructions,
-        sections=investigate_request.sections,
-        trace_span=trace_span,
-        runbooks=runbooks,
-        request_context=request_context,
-    )
+        investigation = ai.investigate(
+            issue,
+            prompt=investigate_request.prompt_template,
+            global_instructions=global_instructions,
+            sections=investigate_request.sections,
+            trace_span=trace_span,
+            runbooks=runbooks,
+            request_context=request_context,
+        )
 
-    (text_response, sections) = process_response_into_sections(investigation.result)
+        (text_response, sections) = process_response_into_sections(investigation.result)
 
-    if sections is None:
-        sentry_helper.capture_sections_none(content=investigation.result)
+        if sections is None:
+            sentry_helper.capture_sections_none(content=investigation.result)
 
-    logging.debug(f"text response: {text_response}")
-    return InvestigationResult(
-        analysis=text_response,
+        logging.debug(f"text response: {text_response}")
+        
+        result = InvestigationResult(
+            analysis=text_response,
+            sections=sections,
+            tool_calls=investigation.tool_calls or [],
+            num_llm_calls=investigation.num_llm_calls,
+            instructions=investigation.instructions,
+            metadata=investigation.metadata,
+        )
+        
+        success = True
+        return result
+        
+    finally:
+        # Record investigation metrics
+        if metrics:
+            duration = time.time() - start_time
+            metrics.record_investigation(source=source, duration=duration, success=success)
         sections=sections,
         tool_calls=investigation.tool_calls or [],
         num_llm_calls=investigation.num_llm_calls,

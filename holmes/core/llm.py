@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+import time
 from abc import abstractmethod
 from math import floor
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
@@ -12,6 +13,14 @@ from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.types.utils import ModelResponse, TextCompletionResponse
 from pydantic import BaseModel, ConfigDict, SecretStr
 from typing_extensions import Self
+
+# Metrics integration
+try:
+    from holmes.core.metrics import get_metrics
+    METRICS_AVAILABLE = True
+except ImportError:
+    METRICS_AVAILABLE = False
+    def get_metrics(): return None
 
 from holmes.clients.robusta_client import (
     RobustaModel,
@@ -408,34 +417,76 @@ class DefaultLLM(LLM):
         # Get the litellm module to use (wrapped or unwrapped)
         litellm_to_use = self.tracer.wrap_llm(litellm) if self.tracer else litellm
 
-        litellm_model_name = self.get_litellm_corrected_name_for_robusta_ai()
-        result = litellm_to_use.completion(
-            model=litellm_model_name,
-            api_key=self.api_key,
-            base_url=self.api_base,
-            api_version=self.api_version,
-            messages=messages,
-            response_format=response_format,
-            drop_params=drop_params,
-            allowed_openai_params=allowed_openai_params,
-            stream=stream,
-            timeout=LLM_REQUEST_TIMEOUT,
-            **tools_args,
-            **self.args,
-            cache_control_injection_points=[
-                {
-                    "location": "message",
-                    "index": -1,  # -1 targets the last message.
-                }
-            ],
-        )
+        # Metrics tracking for LLM calls
+        start_time = time.time()
+        metrics = get_metrics() if METRICS_AVAILABLE else None
 
-        if isinstance(result, ModelResponse):
+        try:
+            litellm_model_name = self.get_litellm_corrected_name_for_robusta_ai()
+            result = litellm_to_use.completion(
+                model=litellm_model_name,
+                api_key=self.api_key,
+                base_url=self.api_base,
+                api_version=self.api_version,
+                messages=messages,
+                response_format=response_format,
+                drop_params=drop_params,
+                allowed_openai_params=allowed_openai_params,
+                stream=stream,
+                timeout=LLM_REQUEST_TIMEOUT,
+                **tools_args,
+                **self.args,
+                cache_control_injection_points=[
+                    {
+                        "location": "message",
+                        "index": -1,  # -1 targets the last message.
+                    }
+                ],
+            )
+
+            # Record LLM metrics
+            if metrics and isinstance(result, ModelResponse):
+                duration = time.time() - start_time
+                provider = self.model.split('/')[0] if '/' in self.model else 'openai'
+                model_name = self.model.split('/')[-1] if '/' in self.model else self.model
+                
+                # Extract token usage
+                input_tokens = None
+                output_tokens = None
+                if hasattr(result, 'usage') and result.usage:
+                    input_tokens = getattr(result.usage, 'prompt_tokens', None)
+                    output_tokens = getattr(result.usage, 'completion_tokens', None)
+                
+                metrics.record_llm_call(
+                    model=model_name,
+                    provider=provider,
+                    operation='completion',
+                    duration=duration,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens
+                )
+
             return result
-        elif isinstance(result, CustomStreamWrapper):
-            return result
-        else:
-            raise Exception(f"Unexpected type returned by the LLM {type(result)}")
+
+        except Exception as e:
+            # Record failed LLM metrics
+            if metrics:
+                duration = time.time() - start_time
+                provider = self.model.split('/')[0] if '/' in self.model else 'openai'
+                model_name = self.model.split('/')[-1] if '/' in self.model else self.model
+                
+                metrics.record_llm_call(
+                    model=model_name,
+                    provider=provider,
+                    operation='completion',
+                    duration=duration,
+                    input_tokens=0,
+                    output_tokens=0,
+                    error=True
+                )
+            raise
+
+
 
     def get_maximum_output_token(self) -> int:
         max_output_tokens = floor(min(64000, self.get_context_window_size() / 5))

@@ -24,6 +24,14 @@ from typing import (
     Union,
 )
 
+# Metrics integration
+try:
+    from holmes.core.metrics import get_metrics
+    METRICS_AVAILABLE = True
+except ImportError:
+    METRICS_AVAILABLE = False
+    def get_metrics(): return None
+
 from holmes.utils.pydantic_utils import build_config_example
 from jinja2 import Template
 from pydantic import (
@@ -281,23 +289,61 @@ class Tool(ABC, BaseModel):
                     invocation=self.get_parameterized_one_liner(params),
                 )
 
+        # Metrics tracking
+        metrics = get_metrics() if METRICS_AVAILABLE else None
         start_time = time.time()
-        result = self._invoke(params=params, context=context)
-        result.icon_url = self.icon_url
+        success = False
+        
+        try:
+            result = self._invoke(params=params, context=context)
+            result.icon_url = self.icon_url
 
-        transformed_result = self._apply_transformers(result)
-        elapsed = time.time() - start_time
-        output_str = (
-            transformed_result.get_stringified_data()
-            if hasattr(transformed_result, "get_stringified_data")
-            else str(transformed_result)
-        )
-        show_hint = f"/show {context.tool_number}" if context.tool_number else "/show"
-        line_count = output_str.count("\n") + 1 if output_str else 0
-        logger.info(
-            f"  [dim]Finished {tool_number_str}in {elapsed:.2f}s, output length: {len(output_str):,} characters ({line_count:,} lines) - {show_hint} to view contents[/dim]"
-        )
-        return transformed_result
+            transformed_result = self._apply_transformers(result)
+            elapsed = time.time() - start_time
+            
+            # Record tool metrics
+            if metrics:
+                toolset_name = getattr(self, 'toolset', None)
+                if toolset_name:
+                    toolset_name = getattr(toolset_name, 'name', 'unknown')
+                else:
+                    toolset_name = 'unknown'
+                success = transformed_result.status != StructuredToolResultStatus.ERROR
+                metrics.record_tool_call(
+                    tool_name=self.name,
+                    toolset=toolset_name,
+                    duration=elapsed,
+                    success=success
+                )
+            
+            output_str = (
+                transformed_result.get_stringified_data()
+                if hasattr(transformed_result, "get_stringified_data")
+                else str(transformed_result)
+            )
+            show_hint = f"/show {context.tool_number}" if context.tool_number else "/show"
+            line_count = output_str.count("\n") + 1 if output_str else 0
+            logger.info(
+                f"  [dim]Finished {tool_number_str}in {elapsed:.2f}s, output length: {len(output_str):,} characters ({line_count:,} lines) - {show_hint} to view contents[/dim]"
+            )
+            return transformed_result
+            
+        except Exception as e:
+            # Record failed tool call
+            if metrics:
+                elapsed = time.time() - start_time
+                toolset_name = getattr(self, 'toolset', None)
+                if toolset_name:
+                    toolset_name = getattr(toolset_name, 'name', 'unknown')
+                else:
+                    toolset_name = 'unknown'
+                metrics.record_tool_call(
+                    tool_name=self.name,
+                    toolset=toolset_name,
+                    duration=elapsed,
+                    success=False
+                )
+            raise
 
     def _is_restricted(self) -> bool:
         if self.restricted:

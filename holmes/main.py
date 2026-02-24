@@ -329,6 +329,15 @@ def ask(
         system_prompt_additions,
     )
 
+    from holmes.core.metrics import initialize_metrics, get_metrics
+    import time
+    
+    # Initialize global metrics if needed
+    initialize_metrics()
+    metrics = get_metrics()
+    
+    start_time = time.time()
+    
     with tracer.start_trace(
         f'holmes ask "{prompt}"', span_type=SpanType.TASK
     ) as trace_span:
@@ -338,6 +347,10 @@ def ask(
             output=response.result,
         )
         trace_url = tracer.get_trace_url()
+    
+    # Record metrics for the investigation
+    investigation_duration = time.time() - start_time
+    metrics.record_investigation('cli', investigation_duration, True)  # True for success
 
     messages = response.messages  # type: ignore # Update messages with the full history
 
@@ -364,6 +377,10 @@ def ask(
 
     if trace_url:
         console.print(f"🔍 View trace: {trace_url}")
+    
+    # Display and push metrics if enabled
+    metrics.display_metrics_summary()
+    metrics.push_metrics()
 
 
 @investigate_app.command()
